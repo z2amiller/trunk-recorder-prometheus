@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <string>
 #include <map>
+#include <set>
 #include <vector>
 #include <cstring>
 
@@ -48,6 +49,12 @@ class Prometheus : public Plugin_Api
   prometheus::Family<prometheus::Counter> *error_counter;
   prometheus::Family<prometheus::Counter> *call_duration_counter;
   prometheus::Family<prometheus::Counter> *source_error_counter;
+
+  std::set<std::string> known_systems;
+  // trunk-recorder calls call_start again whenever a call's talker changes, and
+  // a conventional channel reuses one Call with a new call number for each
+  // transmission. Remember the call number each Call was counted under.
+  std::map<Call *, long> counted_calls;
 
 public:
   // Factory method
@@ -89,7 +96,7 @@ public:
 
     this->calls_counter = &BuildCounter()
                           .Name(prefix+"calls")
-                          .Help("Call history")
+                          .Help("Calls started, including encrypted and unrecorded calls")
                           .Register(*registry);
 
     this->message_counter = &BuildCounter()
@@ -119,6 +126,21 @@ public:
 
     this->exposer->RegisterCollectable(this->registry);
 
+    for (std::vector<System *>::iterator it = systems.begin(); it != systems.end(); it++)
+    {
+      // A conventional channel keeps its Call in the list at all times, so its
+      // series starts at the first calls_active() instead.
+      if ((*it)->get_system_type().rfind("conventional", 0) == 0)
+      {
+        continue;
+      }
+      std::string systemName = (*it)->get_short_name();
+      this->known_systems.insert(systemName);
+      this->active_calls->Add({
+        {"system", systemName},
+      }).Set(0);
+    }
+
     return 0;
   }
 
@@ -127,33 +149,54 @@ public:
     return 0;
   }
 
+  int call_start(Call *call) override
+  {
+    long callNum = call->get_call_num();
+    auto counted = this->counted_calls.find(call);
+    if (counted != this->counted_calls.end() && counted->second == callNum)
+    {
+      return 0;
+    }
+    this->counted_calls[call] = callNum;
+
+    this->calls_counter->Add({
+      {"encrypted", std::to_string(call->get_encrypted())},
+      {"talkgroup", std::to_string(call->get_talkgroup())},
+      {"talkgroup_display", call->get_talkgroup_display()},
+      {"talkgroup_tag", call->get_talkgroup_tag()},
+      {"freq", std::to_string(call->get_freq())},
+      {"system", call->get_short_name()},
+    }).Increment();
+
+    return 0;
+  }
+
   int calls_active(std::vector<Call *> calls) override
   {
+    // Start every system at 0 so its gauge drops back once its last call ends.
     std::map<std::string, int> callsPerSystem;
+    for (auto& systemName : this->known_systems)
+    {
+      callsPerSystem[systemName] = 0;
+    }
 
+    std::map<Call *, long> stillActive;
     for (std::vector<Call *>::iterator it = calls.begin(); it != calls.end(); it++)
     {
       Call *call = *it;
 
       std::string callSystem = call->get_short_name();
-      if (callsPerSystem.find(callSystem) == callsPerSystem.end())
-      {
-        callsPerSystem[callSystem] = 1;
-      }
-      else
-      {
-        callsPerSystem[callSystem] += 1;
-      }
+      this->known_systems.insert(callSystem);
+      callsPerSystem[callSystem] += 1;
 
-      this->calls_counter->Add({
-        {"encrypted", std::to_string(call->get_encrypted())},
-        {"talkgroup", std::to_string(call->get_talkgroup())},
-        {"talkgroup_display", call->get_talkgroup_display()},
-        {"talkgroup_tag", call->get_talkgroup_tag()},
-        {"freq", std::to_string(call->get_freq())},
-        {"system", callSystem},
-      }).Increment();
+      auto counted = this->counted_calls.find(call);
+      if (counted != this->counted_calls.end())
+      {
+        stillActive.insert(*counted);
+      }
     }
+    // Forget calls that have ended.
+    this->counted_calls.swap(stillActive);
 
     for (auto& callPerSystem : callsPerSystem)
     {
